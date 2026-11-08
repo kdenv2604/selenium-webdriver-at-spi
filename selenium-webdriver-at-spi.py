@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2021-2023 Harald Sitter <sitter@kde.org>
+# SPDX-FileCopyrightText: 2026 kdenv2604 contributors
+# Modified 2026: private attachment scope, Avalonia semantics, and atomic readonly Name.
 
 import base64
 import json
@@ -16,9 +18,8 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import gi
-import numpy as np
 import pyatspi
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from lxml import etree
 from werkzeug.exceptions import HTTPException
 
@@ -26,9 +27,9 @@ from app_roles import ROLE_NAMES
 
 import logging
 logging.getLogger("werkzeug").disabled = True
-gi.require_version('Gdk', '3.0')
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gdk, Gio, GLib, Gtk
+from gi.repository import Gio, GLib
+
+from private_scope import PrivateScope, ScopeError, TreeBudget, fresh, require
 
 # Exposes AT-SPI as a webdriver. This is written in python because C sucks and pyatspi is a first class binding so
 # we lose nothing but gain the reduced sucking of python.
@@ -64,6 +65,53 @@ pyatspi.Registry.registerEventListener(
 
 # Using flask because I know nothing about writing REST in python and it seemed the most straight-forward framework.
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 65536
+private_scope = None
+source_materials = None
+
+
+def configure_private(config, token, offer):
+    global private_scope, source_materials
+    require(private_scope is None, 'session not created', 'Server scope уже установлен.')
+    source_materials = offer
+    private_scope = PrivateScope(config, token, pyatspi, Gio, GLib)
+    return private_scope.descriptor()
+
+
+@app.before_request
+def guard_private_request():
+    require(private_scope is not None, 'session not created', 'Нужен private server bootstrap.')
+    return private_scope.guard(request, sessions)
+
+
+@app.errorhandler(ScopeError)
+def scope_error(error):
+    return jsonify({'value': {'error': error.code, 'message': str(error), 'stacktrace': ''}}), error.status
+
+
+@app.route('/source', methods=['GET'])
+def source_offer():
+    return jsonify(source_materials.listing())
+
+
+@app.route('/source/<source_id>', methods=['GET'])
+def source_download(source_id):
+    return Response(source_materials.download(source_id), mimetype='application/octet-stream')
+
+
+@app.route('/session/<session_id>/timeouts', methods=['GET', 'POST'])
+def session_timeouts(session_id):
+    current = sessions[session_id].timeouts
+    if request.method == 'POST':
+        requested = json.loads(request.data)
+        require(isinstance(requested, dict) and set(requested) <= set(current),
+                'invalid argument', 'Неверные W3C timeouts.')
+        require(all(type(value) is int and 0 <= value <= 300000 for value in requested.values()),
+                'invalid argument', 'Timeout вышел за предел.')
+        current.update(requested)
+        return jsonify({'value': None})
+    return jsonify({'value': current})
+
 
 
 @app.errorhandler(Exception)
@@ -77,8 +125,9 @@ def unknown_error(e):
 def status():
     body = {
         'value': {
-            'ready': 'true',
-            'message': 'There is only one state. Hooray!'
+            'ready': private_scope is not None,
+            'message': 'Modified KDE AT-SPI WebDriver, AGPL-3.0-or-later. Corresponding source: /source',
+            'source': {'url': '/source', 'manifestSha256': source_materials.manifest_sha256}
         }
     }
     return json.dumps(body), 200, {'content-type': 'application/json'}
@@ -91,11 +140,16 @@ def maybe_special_key_error(text):
     return
 
 
-def _createNode2(accessible, parentElement, indexInParents=[]):
+def _createNode2(accessible, parentElement, indexInParents=None, budget=None):
     if not accessible:
         return
+    indexInParents = [] if indexInParents is None else indexInParents
+    budget = TreeBudget() if budget is None else budget
+    budget.visit(accessible, len(indexInParents))
+    private_scope.assert_member(accessible)
+    fresh(accessible)
     # A bit of aggressive filtering to not introspect chromium and firefox and the likes when using the desktop root.
-    if accessible.toolkitName != "Qt" and accessible.toolkitName != "at-spi-registry":
+    if accessible.toolkitName not in ("Avalonia", "Qt", "at-spi-registry"):
         return
 
     roleName = accessible.getRoleName()
@@ -122,10 +176,12 @@ def _createNode2(accessible, parentElement, indexInParents=[]):
         states.append(pyatspi.stateToString(state))
     e.set("states", ', '.join(states))
 
-    for i in range(0, accessible.childCount):
+    child_count = accessible.childCount
+    require(0 <= child_count <= 512, 'unknown error', 'Дерево превысило предел детей.')
+    for i in range(child_count):
         newIndex = indexInParents.copy()
         newIndex.append(i)
-        _createNode2(accessible.getChildAtIndex(i), e, newIndex)
+        _createNode2(accessible.getChildAtIndex(i), e, newIndex, budget)
 
     if parentElement != None:
         parentElement.append(e)
@@ -143,7 +199,7 @@ def errorFromException(error, exception):
 
 @app.route('/')
 def index():
-    return 'Servas'
+    return 'Modified KDE AT-SPI WebDriver — AGPL-3.0-or-later. Corresponding source: <a href="/source">/source</a>'
 
 # Encapsulates a Session object. Sessions are opened by the client and contain elements. A session is generally speaking
 # an app.
@@ -152,110 +208,19 @@ def index():
 
 
 class Session:
-
     def __init__(self) -> None:
-        self.id = str(uuid.uuid1())
-        self.elements = {}  # a cache to hold elements between finding and interacting with
-        self.browsing_context = None
-        self.pid = -1
-        # implicit deviates from spec, 0 is unreasonable
+        self.id = str(uuid.uuid4())
+        self.elements = {}
         self.timeouts = {'script': 30000, 'pageLoad': 300000, 'implicit': 5000}
         self.launched = False
-
-        blob = json.loads(request.data)
-        # TODO the blob from ruby is much more complicated god only knows why
-        desired_app = None
-        desired_timeouts = None
-        desired_environ = None
-        if 'desiredCapabilities' in blob:
-            if 'app' in blob['desiredCapabilities']:
-                desired_app = blob['desiredCapabilities']['app']
-            else:
-                desired_app = blob['desiredCapabilities']['appium:app']
-            if 'timeouts' in blob['desiredCapabilities']:
-                desired_timeouts = blob['desiredCapabilities']['timeouts']
-            if 'appium:environ' in blob['desiredCapabilities']:
-                desired_environ = blob['desiredCapabilities']['appium:environ']
-        else:
-            if 'app' in blob['capabilities']['alwaysMatch']:
-                desired_app = blob['capabilities']['alwaysMatch']['app']
-            else:
-                desired_app = blob['capabilities']['alwaysMatch']['appium:app']
-            if 'timeouts' in blob['capabilities']['alwaysMatch']:
-                desired_timeouts = blob['capabilities']['alwaysMatch']['timeouts']
-            if 'appium:environ' in blob['capabilities']['alwaysMatch']:
-                desired_environ = blob['capabilities']['alwaysMatch']['appium:environ']
-
-        if 'SELENIUM_OVERRIDE_LAUNCH' in os.environ and len(os.environ['SELENIUM_OVERRIDE_LAUNCH'].strip()) > 0:
-            desired_app = os.environ['SELENIUM_OVERRIDE_LAUNCH']
-            print(f'[INFO] Overriding app launch command with "{desired_app}"')
-
-        if desired_timeouts:
-            if 'script' in desired_timeouts:
-                self.timeouts['script'] = desired_timeouts['script']
-            if 'pageLoad' in desired_timeouts:
-                self.timeouts['pageLoad'] = desired_timeouts['pageLoad']
-            if 'implicit' in desired_timeouts:
-                self.timeouts['implicit'] = desired_timeouts['implicit']
-
-        if desired_app == 'Root':
-            # NB: at the time of writing there can only be one desktop ever
-            self.browsing_context = pyatspi.Registry.getDesktop(0)
-            return
-
-        end_time = datetime.now() + \
-            timedelta(milliseconds=(self.timeouts['implicit'] * 2))
-
-        context = Gio.AppLaunchContext()
-        context.setenv('QT_ACCESSIBILITY', '1')
-        context.setenv('QT_LINUX_ACCESSIBILITY_ALWAYS_ON', '1')
-        context.setenv('KIO_DISABLE_CACHE_CLEANER', '1')  # don't dangle
-        if isinstance(desired_environ, dict):
-            for key, value in desired_environ.items():
-                context.setenv(key, value)
-
-        def on_launched(context, info, platform_data):
-            self.pid = platform_data['pid']
-
-            while datetime.now() < end_time:
-                time.sleep(1) # do not overwhelm the bus with queries, wait a bit
-                for desktop_index in range(pyatspi.Registry.getDesktopCount()):
-                    desktop = pyatspi.Registry.getDesktop(desktop_index)
-                    for app in desktop:
-                        try:
-                            if app.get_process_id() == self.pid:
-                                self.browsing_context = app
-                                break
-                        except (gi.repository.GLib.GError, AttributeError):
-                            print('stumbled over a broken process. ignoring...')
-                            continue
-                    if self.browsing_context:
-                        break
-                if self.browsing_context:
-                    break
-            if not self.browsing_context:
-                raise RuntimeError('Failed to find application on a11y bus within time limit! It either crashed, or was too slow to start, or is stuck.')
-
-        context.connect("launched", on_launched)
-
-        if desired_app.endswith(".desktop"):
-            appinfo = Gio.DesktopAppInfo.new(desired_app)
-            appinfo.launch([], context)
-            self.launched = True
-        elif desired_app.isnumeric():
-            on_launched(None, None, {'pid': int(desired_app)})
-        else:
-            appinfo = Gio.AppInfo.create_from_commandline(
-                desired_app, None, Gio.AppInfoCreateFlags.NONE)
-            appinfo.launch([], context)
-            self.launched = True
+        self.pid = private_scope.pid
+        private_scope.claim(self.id, json.loads(request.data), self.timeouts)
+        self.browsing_context = private_scope.root
 
     def close(self) -> None:
-        if self.launched:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        # Это attach к уже защищённому worker, не право завершать его процесс.
+        private_scope.release(self.id)
+        self.elements.clear()
 
 
 @app.route('/session', methods=['GET', 'POST', 'DELETE'])
@@ -274,7 +239,7 @@ def session():
             return errorFromMessage(error='session not created',
                                     message='Application was not found on the a11y bus for unknown reasons. It probably failed to register on the bus.'), 500
 
-        return json.dumps({'value': {'sessionId': session.id, 'capabilities': {"app": session.browsing_context.name}}}), 200, {'content-type': 'application/json'}
+        return json.dumps({'value': {'sessionId': session.id, 'capabilities': {**private_scope.session_capabilities()}}}), 200, {'content-type': 'application/json'}
     elif request.method == 'GET':
         # TODO impl
         print("GET called when not expected", request)
@@ -292,6 +257,7 @@ def session_delete(session_id):
             return json.dumps({'value': {'error': 'no such window'}}), 404, {'content-type': 'application/json'}
 
         session.close()
+        sessions.pop(session_id, None)
         return json.dumps({'value': None}), 200, {'content-type': 'application/json'}
 
 
@@ -315,7 +281,7 @@ def session_source(session_id):
         return json.dumps({'value': {'error': 'no such window'}}), 404, {'content-type': 'application/json'}
 
     doc = _createNode2(session.browsing_context, None)
-    return json.dumps({'value': etree.tostring(doc, pretty_print=False).decode("utf-8")}), 200, {'content-type': 'application/xml'}
+    return json.dumps({'value': etree.tostring(doc, pretty_print=False).decode("utf-8")}), 200, {'content-type': 'application/json'}
 
 
 # NB: custom method to get the source without json wrapper
@@ -333,57 +299,55 @@ def check_requires_button_compat():
     return major > 2 or (major == 2 and minor >= 53)
 requires_button_compat = check_requires_button_compat()
 
-def locator(session, strategy, selector, start, findAll = False):
-    end_time = datetime.now() + \
-        timedelta(milliseconds=session.timeouts['implicit'])
-    results = []
-
-    while datetime.now() < end_time:
+def locator(session, strategy, selector, start, findAll=False):
+    require(strategy in ('xpath', 'accessibility id', 'class name', 'name', 'description'),
+            'invalid selector', 'Неподдерживаемый locator strategy.')
+    require(isinstance(selector, str) and 0 < len(selector) <= 4096,
+            'invalid argument', 'Нужен непустой ограниченный selector.')
+    end_time = time.monotonic() + session.timeouts['implicit'] / 1000
+    while True:
+        private_scope.assert_live()
+        private_scope.assert_member(start)
+        results = []
         if strategy == 'xpath':
             doc = _createNode2(start, None)
-            for c in doc.xpath(selector):
-                path = [int(x) for x in c.get('path').split()]
-                # path is relative to the app root, not our start item!
-                item = session.browsing_context
-                for i in path:
-                    item = item[i]
-                if c.get('name') != item.name or c.get('description') != item.description:
-                    return []
+            try:
+                selected = doc.xpath(selector)
+            except etree.XPathError as error:
+                raise ScopeError('invalid selector', 'Неверный XPath.') from error
+            require(isinstance(selected, list), 'invalid selector', 'XPath должен выбирать элементы.')
+            for item_xml in selected:
+                require(hasattr(item_xml, 'get') and item_xml.get('path') is not None,
+                        'invalid selector', 'XPath должен выбирать элементы дерева.')
+                item = start
+                for index in map(int, item_xml.get('path').split()):
+                    item = item.getChildAtIndex(index)
+                private_scope.assert_member(item)
+                fresh(item)
+                if item_xml.get('name') != item.name or item_xml.get('description') != item.description:
+                    raise ScopeError('stale element reference', 'Дерево изменилось во время XPath.')
                 results.append(item)
         else:
-            # In a thrilling turn of events [push button | foo] became [button | foo] as of at-spi 2.53. Add compatibility
-            if requires_button_compat:
-                if '[push button |' in selector:
-                    print("    --> [push button | foo] is deprecated. Please port to [button | foo]")
-                    selector = selector.replace('[push button |', '[button |')
-
-            # TODO can I switch this in python +++ raise on unmapped strategy
-            pred = None
+            if requires_button_compat and '[push button |' in selector:
+                selector = selector.replace('[push button |', '[button |')
+            for item in private_scope.walk(start, include_start=start == session.browsing_context):
+                if strategy == 'accessibility id':
+                    matches = item.accessibleId == selector
+                elif strategy == 'class name':
+                    matches = str(item) == selector and (item.getState().contains(pyatspi.STATE_VISIBLE) or item.getState().contains(pyatspi.STATE_SENSITIVE))
+                elif strategy == 'name':
+                    matches = item.name == selector and (item.getState().contains(pyatspi.STATE_VISIBLE) or item.getState().contains(pyatspi.STATE_SENSITIVE))
+                else:
+                    matches = item.description == selector and (item.getState().contains(pyatspi.STATE_VISIBLE) or item.getState().contains(pyatspi.STATE_SENSITIVE))
+                if matches:
+                    results.append(item)
+                    if not findAll and strategy != 'accessibility id':
+                        break
             if strategy == 'accessibility id':
-                def pred(x): return x.accessibleId.endswith(selector) and (x.getState().contains(pyatspi.STATE_VISIBLE) and x.getState().contains(pyatspi.STATE_SENSITIVE))
-            # pyatspi strings "[ roleName | name ]"
-            elif strategy == 'class name':
-                def pred(x): return str(x) == selector and (x.getState().contains(
-                    pyatspi.STATE_VISIBLE) or x.getState().contains(pyatspi.STATE_SENSITIVE))
-            elif strategy == 'name':
-                def pred(x): return x.name == selector and (x.getState().contains(
-                    pyatspi.STATE_VISIBLE) or x.getState().contains(pyatspi.STATE_SENSITIVE))
-            elif strategy == 'description':
-                def pred(x): return x.description == selector and (x.getState().contains(
-                    pyatspi.STATE_VISIBLE) or x.getState().contains(pyatspi.STATE_SENSITIVE))
-            # there are also id and accessibleId but they seem not ever set. Not sure what to make of that :shrug:
-            if findAll:
-                accessible = pyatspi.findAllDescendants(start, pred)
-                if accessible:
-                    results += accessible
-            else:
-                accessible = pyatspi.findDescendant(start, pred)
-                if accessible:
-                    results.append(accessible)
-        if len(results) > 0:
-            break
-
-    return results
+                require(len(results) <= 1, 'invalid selector', 'AutomationId неоднозначен внутри окна.')
+        if results or time.monotonic() >= end_time:
+            return results if findAll else results[:1]
+        time.sleep(min(EVENTLOOP_TIME, max(0, end_time - time.monotonic())))
 
 
 @app.route('/session/<session_id>/element', methods=['GET', 'POST'])
@@ -409,7 +373,7 @@ def session_element(session_id=None):
         return json.dumps({'value': {'error': 'no such element'}}), 404, {'content-type': 'application/json'}
 
     result = results[0]
-    unique_id = result.path.replace('/', '-')
+    unique_id = private_scope.remember(session, result)
     session.elements[unique_id] = result
     return json.dumps({'value': {'element-6066-11e4-a52e-4f735466cecf': unique_id}}), 200, {'content-type': 'application/json'}
 
@@ -438,7 +402,7 @@ def session_element2(session_id=None):
 
     serializations = []
     for result in results:
-        unique_id = result.path.replace('/', '-')
+        unique_id = private_scope.remember(session, result)
         session.elements[unique_id] = result
         serializations.append({'element-6066-11e4-a52e-4f735466cecf': unique_id})
 
@@ -447,40 +411,18 @@ def session_element2(session_id=None):
 
 @app.route('/session/<session_id>/element/<element_id>/click', methods=['GET', 'POST'])
 def session_element_click(session_id, element_id):
-    session = sessions[session_id]
-    if not session:
-        return json.dumps({'value': {'error': 'no such window'}}), 404, {'content-type': 'application/json'}
-
-    element = session.elements[element_id]
-    if not element:
-        return json.dumps({'value': {'error': 'no such element'}}), 404, {'content-type': 'application/json'}
-
-    action = element.queryAction()
-    availableActions = {}
-    for i in range(0, action.nActions):
-        availableActions[action.getName(i)] = i
-
-    keys = availableActions.keys()
-    if 'SetFocus' in keys: # this is used in addition to actual actions so focus is where it would be expected after a click
-        action.doAction(availableActions['SetFocus'])
-        time.sleep(EVENTLOOP_TIME)
-
-    if 'Set Focus' in keys: # alternative name for above
-        action.doAction(availableActions['Set Focus'])
-        time.sleep(EVENTLOOP_TIME)
-
+    element = sessions[session_id].elements[element_id]
+    private_scope.require_interactable(element)
     try:
-        if 'Press' in keys:
-            action.doAction(availableActions['Press'])
-        elif 'Toggle' in keys:
-            action.doAction(availableActions['Toggle'])
-        elif 'ShowMenu' in keys:
-            action.doAction(availableActions['ShowMenu'])
-    except gi.repository.GLib.GError as e:
-        print(e)
-        print("Ignoring! There is a chance your application is misbehaving. Could also just be a blocked eventloop though.")
-    time.sleep(EVENTLOOP_TIME)
-
+        action = element.queryAction()
+        available = [action.getName(index) for index in range(action.nActions)]
+        # Avalonia публикует точный семантический click, без pointer/focus fallback.
+        names = ('click',) if element.toolkitName == 'Avalonia' else ('Press', 'Toggle', 'ShowMenu')
+        candidates = [index for index, name in enumerate(available) if name in names]
+        require(len(candidates) == 1, 'unsupported operation', 'Нет одного поддерживаемого click action.')
+        require(action.doAction(candidates[0]) is True, 'invalid element state', 'AT-SPI action отклонён.')
+    except NotImplementedError as error:
+        raise ScopeError('unsupported operation', 'Нет настоящего Action interface.') from error
     return json.dumps({'value': None}), 200, {'content-type': 'application/json'}
 
 
@@ -535,10 +477,12 @@ def session_element_attribute(session_id, element_id, name):
     if not element:
         return json.dumps({'value': {'error': 'no such element'}}), 404, {'content-type': 'application/json'}
 
-    if name == "accessibility-id":
+    if name in ('Name', 'name') and private_scope.is_marker(element_id):
+        return json.dumps({'value': private_scope.marker_name(element_id)}), 200, {'content-type': 'application/json'}
+    if name in ('AutomationId', 'accessibility-id'):
         return json.dumps({'value': element.accessibleId}), 200, {'content-type': 'application/json'}
 
-    if name == "name":
+    if name in ("Name", "name"):
         return json.dumps({'value': element.name}), 200, {'content-type': 'application/json'}
 
     if name == "value":
@@ -576,7 +520,7 @@ def session_element_element(session_id, element_id):
         return json.dumps({'value': {'error': 'no such element'}}), 404, {'content-type': 'application/json'}
 
     result = results[0]
-    unique_id = result.path.replace('/', '-')
+    unique_id = private_scope.remember(session, result)
     session.elements[unique_id] = result
     return json.dumps({'value': {'element-6066-11e4-a52e-4f735466cecf': unique_id}}), 200, {'content-type': 'application/json'}
 
@@ -603,7 +547,7 @@ def session_element_elements(session_id, element_id):
 
     serializations = []
     for result in results:
-        unique_id = result.path.replace('/', '-')
+        unique_id = private_scope.remember(session, result)
         session.elements[unique_id] = result
         serializations.append({'element-6066-11e4-a52e-4f735466cecf': unique_id})
 
@@ -611,37 +555,19 @@ def session_element_elements(session_id, element_id):
 
 @app.route('/session/<session_id>/element/<element_id>/value', methods=['POST'])
 def session_element_value(session_id, element_id):
-    session = sessions[session_id]
-    if not session:
-        return json.dumps({'value': {'error': 'no such window'}}), 404, {'content-type': 'application/json'}
-
-    element = session.elements[element_id]
-    if not element:
-        return json.dumps({'value': {'error': 'no such element'}}), 404, {'content-type': 'application/json'}
-
-    blob = json.loads(request.data)
-    text = blob['text']
-
+    element = sessions[session_id].elements[element_id]
+    private_scope.require_interactable(element)
+    text = json.loads(request.data).get('text')
+    require(isinstance(text, str) and len(text) <= 32768, 'invalid argument', 'Неверный текст ввода.')
     try:
         maybe_special_key_error(text)
         offset = element.queryText().caretOffset
-        textElement = element.queryEditableText()
-        textElement.insertText(offset, text, len(text))
-        return json.dumps({'value': None}), 200, {'content-type': 'application/json'}
-    except (SeleniumSpecialKeyError, NotImplementedError) as e:
-        print(f"falling back to synthesizing keyboard events: {e if str(e) else 'item does not support text input'}")
-        action = element.queryAction()
-        processed = False
-        for i in range(0, action.nActions):
-            if action.getName(i) == 'SetFocus' or action.getName(i) == 'Set Focus':
-                processed = True
-                action.doAction(i)
-                time.sleep(EVENTLOOP_TIME) # give the focus time to apply
-                generate_keyboard_event_text(text)
-                break
-        if not processed:
-            raise RuntimeError("element's actions list didn't contain SetFocus. The element may be malformed")
-        return json.dumps({'value': None}), 404, {'content-type': 'application/json'}
+        editable = element.queryEditableText()
+        require(editable.insertText(offset, text, len(text)) is True,
+                'invalid element state', 'EditableText отклонил ввод.')
+    except (SeleniumSpecialKeyError, NotImplementedError) as error:
+        raise ScopeError('unsupported operation', 'Нужен EditableText; глобальный ввод запрещён.') from error
+    return json.dumps({'value': None}), 200, {'content-type': 'application/json'}
 
 
 @app.route('/session/<session_id>/execute/sync', methods=['POST'])
@@ -673,38 +599,14 @@ def session_execute(session_id):
 
 @app.route('/session/<session_id>/element/<element_id>/clear', methods=['POST'])
 def session_element_clear(session_id, element_id):
-    session = sessions[session_id]
-    if not session:
-        return json.dumps({'value': {'error': 'no such window'}}), 404, {'content-type': 'application/json'}
-
-    element = session.elements[element_id]
-    if not element:
-        return json.dumps({'value': {'error': 'no such element'}}), 404, {'content-type': 'application/json'}
-
-    characterCount = element.queryText().characterCount
+    element = sessions[session_id].elements[element_id]
+    private_scope.require_interactable(element)
     try:
-        textElement = element.queryEditableText()
-        textElement.deleteText(0, characterCount)
-        return json.dumps({'value': None}), 200, {'content-type': 'application/json'}
-    except NotImplementedError:
-        print("element is not text type, falling back to synthesizing keyboard events")
-        action = element.queryAction()
-        processed = False
-        for i in range(0, action.nActions):
-            if action.getName(i) == 'SetFocus' or action.getName(i) == 'Set Focus':
-                processed = True
-                action.doAction(i)
-                time.sleep(EVENTLOOP_TIME) # give the focus time to apply
-
-                pseudo_text = ''
-                pseudo_text += '\ue010' # end
-                for _ in range(characterCount):
-                    pseudo_text += '\ue003'  # backspace
-                generate_keyboard_event_text(pseudo_text)
-                break
-        if not processed:
-            raise RuntimeError("element's actions list didn't contain SetFocus. The element may be malformed")
-        return json.dumps({'value': None}), 200, {'content-type': 'application/json'}
+        require(element.queryEditableText().setTextContents('') is True,
+                'invalid element state', 'EditableText отклонил очистку.')
+    except NotImplementedError as error:
+        raise ScopeError('unsupported operation', 'Нужен EditableText; keyboard fallback запрещён.') from error
+    return json.dumps({'value': None}), 200, {'content-type': 'application/json'}
 
 
 @app.route('/session/<session_id>/appium/device/app_state', methods=['POST'])
@@ -889,6 +791,7 @@ def session_appium_compare_images(session_id):
     return_value: dict = {}
 
     import cv2 as cv  # The extension is slow, so load it on demand
+    import numpy as np
 
     cv_image1 = cv.imdecode(np.frombuffer(base64.b64decode(blob['firstImage']), np.uint8), cv.IMREAD_COLOR)
     cv_image2 = cv.imdecode(np.frombuffer(base64.b64decode(blob['secondImage']), np.uint8), cv.IMREAD_COLOR)
@@ -1011,6 +914,10 @@ def generate_keyboard_event_text(text):
             time.sleep(EVENTLOOP_TIME)
 
 def keyval_to_keycode(keyval):
+    # Закрытая original global-input ветка; semantic server не импортирует GTK/GDK.
+    gi.require_version('Gdk', '3.0')
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gdk, Gtk
     keymap = Gdk.Keymap.get_default()
     ret, keys = keymap.get_entries_for_keyval(keyval)
     if not ret:
@@ -1020,6 +927,10 @@ def keyval_to_keycode(keyval):
 
 
 def char_to_keyval(ch):
+    # Закрытая original global-input ветка; semantic server не импортирует GTK/GDK.
+    gi.require_version('Gdk', '3.0')
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gdk, Gtk
     keyval = Gdk.unicode_to_keyval(ord(ch))
     # I Don't know why this doesn't work, also doesn't work with \033 as input. :((
     # https://gitlab.gnome.org/GNOME/gtk/-/blob/gtk-3-24/gdk/gdkkeyuni.c
@@ -1051,6 +962,10 @@ def char_to_keyval(ch):
 
 
 def get_clipboard(content_type):
+    # Закрытая original global-input ветка; semantic server не импортирует GTK/GDK.
+    gi.require_version('Gdk', '3.0')
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gdk, Gtk
     # NOTE: need a window because on wayland we must be the active window to manipulate the clipboard (currently anyway)
     window = Gtk.Window()
     window.set_default_size(20, 20)
@@ -1074,6 +989,10 @@ def get_clipboard(content_type):
 
 
 def set_clipboard(content, content_type):
+    # Закрытая original global-input ветка; semantic server не импортирует GTK/GDK.
+    gi.require_version('Gdk', '3.0')
+    gi.require_version('Gtk', '3.0')
+    from gi.repository import Gdk, Gtk
     # NOTE: need a window because on wayland we must be the active window to manipulate the clipboard (currently anyway)
     window = Gtk.Window()
     window.set_default_size(20, 20)

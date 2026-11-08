@@ -1,0 +1,24 @@
+{
+  "upstream": {
+    "name": "KDE selenium-webdriver-at-spi",
+    "repository": "https://invent.kde.org/sdk/selenium-webdriver-at-spi",
+    "mirror": "https://github.com/KDE/selenium-webdriver-at-spi",
+    "commit": "4199d3ea3ccdcaa175b5a06ed3ad8f1af498f38a",
+    "baseGitBlobs": {
+      "selenium-webdriver-at-spi.py": "689fff06ceda7267124b76fdeab2ac52d6e8aba4",
+      "app_roles.py": "0c607335baebad7c6a15aae8ec709b432cb2f771",
+      "README.md": "f4379825d220299488ae1ecc0eab54c187c31731",
+      "requirements.txt": "42e576b176d497588648557a8581d7dcd5ffbc91"
+    }
+  },
+  "fork": {
+    "copyright": "Copyright 2026 kdenv2604 contributors",
+    "license": "AGPL-3.0-or-later",
+    "modifiedOrAddedFiles": {
+      "selenium-webdriver-at-spi.py": "8b8a0c2d036a9adf646c09179002f93f81b280f7c4c3867d7f0c81febb2a1a42",
+      "private_scope.py": "bf42cb8630609fbd86c256a1cae19968295ca6740d0e5e767cfdf9cda611452a",
+      "source_offer.py": "29c28ffd21659b62f81d0c6219e50c1025ebb826f236e0eba0906bca2aa6bfe8",
+      "run_private.py": "c8db2576ce5d6a49e20677b2c575bb6454aef57b374905d3a448c4dd693e0e39"
+    }
+  }
+}

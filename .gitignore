@@ -9,3 +9,9 @@ cmake-build-debug*
 .cache
 /.vscode
 /__pycache__
+
+# Never commit runtime secrets, private topology, or generated offers.
+/private-config*.json
+/*.token
+/*.ready.json
+/source-offer/
